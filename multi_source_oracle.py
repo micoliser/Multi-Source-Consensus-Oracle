@@ -11,10 +11,19 @@ Most on-chain oracles trust a single data source (one API, one page). If that
 source is wrong, down, or manipulated, every consumer of the oracle inherits
 the error. This primitive removes the single-source trust assumption by:
 
-  1. Fetching the same data point from N independent web sources.
+  1. Fetching the same data point from N (N >= 3) independent web sources.
   2. Using an LLM to extract a numeric value from each source's raw content.
-  3. Reconciling the values with a median + tolerance-band outlier filter,
-     so no single rogue or stale source can dominate the result.
+  3. Finding the largest cluster of mutually-agreeing values and requiring
+     that cluster to reach a strict majority of all sources before
+     committing a consensus value -- otherwise the update is REJECTED
+     outright rather than silently averaging in disagreeing readings.
+
+A minimum of 3 sources is required, and duplicate source URLs are rejected
+at registration. Both are load-bearing, not arbitrary: with only 2 sources,
+a disagreeing pair is always exactly equidistant from their own average, so
+there is no way to determine which one (if either) is wrong -- a lone bad
+or manipulated source can never be outvoted. Outlier detection only becomes
+mathematically possible once a majority can actually outnumber a minority.
 
 CONSENSUS DESIGN
 -----------------------------------------------------------------------
@@ -31,10 +40,11 @@ equivalent, given the feed's configured tolerance and normal market/data
 drift?" This is the actual Equivalence Principle problem multi-source
 oracles have to solve, not a cosmetic wrapper around one LLM call.
 
-If fewer than 2 sources return a usable value, the block reports an
-explicit error state instead of fabricating a number, and the contract
-does not update the feed -- callers can detect and handle degraded
-reliability rather than silently trusting bad data.
+If fewer than 3 sources return a usable value, or if no cluster of values
+reaches a strict majority of agreement, the block reports an explicit
+error state instead of fabricating a number, and the contract does not
+update the feed -- callers can detect and handle degraded reliability
+rather than silently trusting a result skewed by disagreeing sources.
 
 STORAGE DESIGN NOTE
 --------------------
@@ -48,7 +58,7 @@ builders to copy without fighting storage-generic edge cases.
 
 REUSE
 -----
-Any builder can register a feed by pointing it at 2+ public web pages that
+Any builder can register a feed by pointing it at 3+ public web pages that
 contain the same real-world numeric fact (a price, a count, a rate, an
 index level) plus a short natural-language hint describing what to
 extract. This makes the contract a general-purpose primitive, not a
@@ -98,8 +108,18 @@ class MultiSourceOracle(gl.Contract):
         extraction_hint: str,
         tolerance_bps: int,
     ) -> int:
-        if len(sources) < 2:
-            raise gl.vm.UserError("register_feed requires at least 2 independent sources")
+        if len(sources) < 3:
+            raise gl.vm.UserError(
+                "register_feed requires at least 3 independent sources -- "
+                "outlier detection is mathematically impossible with only 2, "
+                "since a disagreeing pair is always equidistant from their "
+                "own average and a lone bad source can never be outvoted"
+            )
+        if len(set(url.strip().lower() for url in sources)) != len(sources):
+            raise gl.vm.UserError(
+                "duplicate source URLs are not allowed -- each source must be "
+                "independent, and repeating a URL does not add real redundancy"
+            )
         if tolerance_bps < 0 or tolerance_bps > 5000:
             raise gl.vm.UserError("tolerance_bps must be between 0 and 5000 (0-50%)")
 
@@ -171,7 +191,7 @@ If you cannot confidently find the requested number on this page, set
                     except (TypeError, ValueError):
                         continue
 
-            if len(extracted_values) < 2:
+            if len(extracted_values) < 3:
                 return json.dumps(
                     {
                         "error": "insufficient_sources",
@@ -179,29 +199,44 @@ If you cannot confidently find the requested number on this page, set
                     }
                 )
 
-            extracted_values.sort()
-            mid = len(extracted_values) // 2
-            if len(extracted_values) % 2 == 1:
-                median = extracted_values[mid]
-            else:
-                median = (extracted_values[mid - 1] + extracted_values[mid]) / 2
-
             tol = tolerance_bps_local / 10000.0
-            if median != 0:
-                kept = [
-                    v for v in extracted_values if abs(v - median) <= abs(median) * tol
+
+            # Find the largest cluster of mutually-agreeing values, using
+            # each value in turn as a candidate reference point. This is
+            # what actually makes outlier detection possible: unlike
+            # measuring distance to a single global median (which the
+            # outlier itself skews), this asks "how many OTHER readings
+            # agree with THIS one" for every candidate, so a minority of
+            # bad readings can't drag the accepted cluster their way.
+            best_cluster: list[float] = []
+            for candidate in extracted_values:
+                ref = candidate if candidate != 0 else 1e-12
+                cluster = [
+                    v for v in extracted_values if abs(v - candidate) <= abs(ref) * tol
                 ]
-            else:
-                kept = extracted_values
+                if len(cluster) > len(best_cluster):
+                    best_cluster = cluster
 
-            if not kept:
-                kept = extracted_values  # tolerance excluded everything: fall back
+            # Require a strict majority of all sources to actually agree.
+            # This is the fix for the "empty-filter fallback" bug: if no
+            # cluster reaches quorum, FAIL CLOSED and report an error --
+            # never silently fall back to averaging in disagreeing values.
+            quorum_needed = (len(extracted_values) // 2) + 1
+            if len(best_cluster) < quorum_needed:
+                return json.dumps(
+                    {
+                        "error": "no_quorum_agreement",
+                        "usable_sources": len(extracted_values),
+                        "largest_cluster": len(best_cluster),
+                        "quorum_needed": quorum_needed,
+                    }
+                )
 
-            consensus = sum(kept) / len(kept)
+            consensus = sum(best_cluster) / len(best_cluster)
             return json.dumps(
                 {
                     "value": round(consensus, 8),
-                    "sources_used": len(kept),
+                    "sources_used": len(best_cluster),
                     "sources_total": len(extracted_values),
                 }
             )
@@ -210,13 +245,14 @@ If you cannot confidently find the requested number on this page, set
             "Both answers are JSON objects describing a reconciled numeric value "
             "pulled independently from live web sources at slightly different "
             "moments in time. Treat them as equivalent if: (a) both report the "
-            f"same error state, or (b) both report a 'value', those values are "
-            f"within {tolerance_bps_local} basis points of each other (accounting "
+            "same error type ('insufficient_sources' or 'no_quorum_agreement'), "
+            f"or (b) both report a 'value', those values are within "
+            f"{tolerance_bps_local} basis points of each other (accounting "
             "for normal real-world data drift between fetches), and 'sources_used' "
             "counts are not wildly inconsistent (differ by at most 1). They are "
             "NOT equivalent if one reports an error while the other reports a "
-            "valid value, or if the values diverge by more than the stated "
-            "tolerance."
+            "valid value, if the error types differ, or if the values diverge by "
+            "more than the stated tolerance."
         )
 
         raw_result = gl.eq_principle.prompt_comparative(fetch_and_reconcile, principle)

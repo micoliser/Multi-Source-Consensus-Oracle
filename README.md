@@ -9,10 +9,12 @@ source should be fully trusted?**
 Traditional oracles (even "decentralized" ones) usually still resolve to a
 single upstream API per data point. If that API is wrong, stale, or
 compromised, everything built on top inherits the error. This contract
-removes that single-source assumption: register a feed against 2+
+removes that single-source assumption: register a feed against 3+
 independent public web pages describing the same fact, and the contract
 fetches all of them, extracts a value from each, and reconciles them into
-one consensus number using a median + outlier-tolerance filter.
+one consensus number by finding the largest cluster of mutually-agreeing
+values and requiring that cluster to reach a strict majority before
+accepting it.
 
 It is intentionally a **primitive**, not an app: no frontend, no specific
 data type baked in. Any builder can register a feed for a price, a count, a
@@ -21,13 +23,17 @@ find this number."
 
 ## How GenLayer consensus is actually used here
 
+This is the part that matters most for reviewers, so it's worth being
+explicit:
+
 1. **Inner consensus (multi-source → one number).** Inside a single
    non-deterministic block, the contract fetches every registered source,
-   asks an LLM to extract a number from each, sorts the results, computes
-   the median, and discards anything outside a configurable tolerance band
-   (`tolerance_bps`) before averaging what's left. A single bad or
-   manipulated source can't dominate the result as long as a majority of
-   sources agree.
+   asks an LLM to extract a number from each, then finds the largest
+   cluster of values that mutually agree within a configurable tolerance
+   band (`tolerance_bps`) of each other. That cluster must reach a strict
+   majority of all sources, or the update is rejected outright — a single
+   bad or manipulated source can never be outvoted with fewer than 3
+   sources, which is why 3 is the enforced minimum.
 
 2. **Outer consensus (validator → validator).** GenVM's leader runs the
    whole fetch-and-reconcile process once. Every validator independently
@@ -44,17 +50,24 @@ find this number."
    has to solve -- not "did the LLM say yes," but "are two independently
    reconciled real-world measurements close enough to be the same fact."
 
-3. **Fail-closed, not fail-open.** If fewer than 2 sources return a usable
-   value, the block returns an explicit `insufficient_sources` error and
-   the contract does **not** update feed state. Callers can detect and
-   react to degraded reliability instead of silently receiving a stale or
-   fabricated number.
+3. **Fail-closed, not fail-open.** If fewer than 3 sources return a usable
+   value, or if no cluster of extracted values reaches a strict majority
+   of agreement with each other, the block returns an explicit error
+   (`insufficient_sources` or `no_quorum_agreement`) and the contract does
+   **not** update feed state. A minimum of 3 sources is enforced at
+   registration specifically because outlier detection is mathematically
+   impossible with only 2: a disagreeing pair is always exactly
+   equidistant from their own average, so there's no way to tell which
+   one (if either) is wrong, and a single bad source can never be
+   outvoted. Duplicate source URLs are also rejected at registration, so
+   a feed can't satisfy the 3-source minimum by padding with copies of
+   the same URL.
 
 ## Contract interface
 
 | Method                                                                | Type  | Description                                                                                                             |
 | --------------------------------------------------------------------- | ----- | ----------------------------------------------------------------------------------------------------------------------- |
-| `register_feed(description, sources, extraction_hint, tolerance_bps)` | write | Registers a new feed. Requires ≥2 sources. Returns `feed_id`.                                                           |
+| `register_feed(description, sources, extraction_hint, tolerance_bps)` | write | Registers a new feed. Requires ≥3 sources, all distinct URLs. Returns `feed_id`.                                        |
 | `request_update(feed_id)`                                             | write | Triggers a full fetch-reconcile-consensus round. Updates feed state on success; returns the raw JSON result either way. |
 | `deactivate_feed(feed_id)`                                            | write | Owner-only. Marks a feed inactive.                                                                                      |
 | `get_feed(feed_id)`                                                   | view  | Returns full feed metadata and latest value.                                                                            |
@@ -129,7 +142,7 @@ are `gl.get_webpage`, `gl.exec_prompt`, and
 
 ## Testing
 
-See `test.py` for a test skeleton using `genlayer-test`
+See `test_multi_source_oracle.py` for a test skeleton using `genlayer-test`
 (`gltest`)'s mock LLM and mock web response system, which lets you exercise
 the reconciliation logic deterministically without hitting real websites or
 real LLM providers.
