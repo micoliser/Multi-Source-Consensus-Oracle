@@ -63,7 +63,7 @@ reach consensus with fewer agreeing sources than a true majority of its
 full configured set, regardless of how many sources are actually reachable
 at update time.
 
-CONSENSUS DESIGN (the part that matters for this submission category)
+CONSENSUS DESIGN
 -----------------------------------------------------------------------
 Steps 1-3 above happen inside a single non-deterministic block. GenVM's
 leader executes it once; every validator independently re-executes the
